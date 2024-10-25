@@ -1,0 +1,419 @@
+;license:MIT
+;(c) 2024 by 4am
+;
+!cpu 6502
+!to "build/PROBABLE.SYSTEM#FF2000",plain
+*=$2000
+
+PREFIX_BUFFER             = $0280    ; $40 bytes (only during startup)
+BOOT_PRODOS_BUFFER        = $9600    ; $400 bytes (only during startup)
+PRODOS_BUFFER             = $B800    ; $400 bytes (reused on every RWTS call)
+RWTS                      = $BD00    ; max $100 bytes (persistent)
+first_zp                  = $40      ; first zero page address saved by SwapZP
+last_zp                   = $4F      ; last zero page address saved by SwapZP
+
+         !src  "src/constants.a"     ; no code in here
+
+;
+; Ensure ProDOS has a current prefix, otherwise opening any file will fail,
+; which is bad. If launched from Bitsy Bye, there will be no current prefix.
+; In that case, we get the boot volume name, then set the prefix to that.
+; PREFIX_BUFFER ($40 bytes) is clobbered but may be reused after.
+;
+prefix_loop
+         jsr   PRODOS_MLI
+op_prefix
+         !byte CMD_GETPREFIX         ; self-modified
+         !word parm_prefix
+         ldx   PREFIX_BUFFER         ; if we have a prefix, we're done
+         bne   clear_memory_map
+
+         ; no prefix (len=0) so get boot volume name instead
+         lda   PRODOS_BOOT_UNIT
+         sta   parm_online_unit
+         jsr   PRODOS_MLI
+         !byte CMD_ONLINE
+         !word parm_online
+
+         lda   PREFIX_BUFFER + 1
+         and   #$0F
+         tax
+         inx
+         stx   PREFIX_BUFFER
+         lda   #$2F
+         sta   PREFIX_BUFFER + 1
+         ; PREFIX_BUFFER is now a length-prefixed string
+         ; of '/' + the boot volume name
+
+         dec   op_prefix             ; -> CMD_SETPREFIX
+         bne   prefix_loop           ; always branches
+
+parm_prefix
+         !byte 1
+         !word PREFIX_BUFFER
+parm_online
+         !byte 2
+parm_online_unit
+         !byte SELF_MODIFIED_BYTE
+         !word PREFIX_BUFFER + 1
+
+clear_memory_map
+         ; clear ProDOS memory bitmap to allow loading data anywhere,
+         ; even zero page (you would be AMAZED at how many DOS programs
+         ; BLOAD tiny files directly into zero page)
+         ldx   #$18
+         lda   #$00
+-        sta   PRODOS_MEMORY_MAP - 1, x
+         dex
+         bne   -
+
+         ; copy RWTS DOS shim into place
+         ;X=0
+-        lda   move_rwts_start, x
+         sta   RWTS, x
+         inx
+         bne   -
+
+         ; read T00,S00..T00,S06 into B600..BCFF
+         ; (B800..BBFF will be clobbered as soon as the disk
+         ; executes any RWTS operation through our shim, but
+         ; Pronto-DOS calls BA69 once during startup and
+         ; Lock-It-Up calls BC09 once during startup and this is
+         ; easier and safer than patching those out
+         jsr   PRODOS_MLI
+         !byte CMD_OPEN
+         !word parm_boot_open
+         jsr   PRODOS_MLI
+         !byte CMD_READ
+         !word parm_boot_read
+
+         lda   $B700                 ; if B700 isn't DOS-shaped then don't preload
+         cmp   #$8E                  ; (program will still work if it just uses
+         bne   done_patches          ;  RWTS ops and never calls routines in BFxx
+                                     ;  e.g. Stickybear, Mindplay)
+         lda   $B724                 ; DOS variant that sets reset vector
+         cmp   #$02                  ; before filling RWTS parameter table
+         bne   maybe_preload1
+         lda   $B729
+         bne   maybe_preload2
+maybe_preload1
+         lda   $B715
+         cmp   #$03                  ; 03 = Lock-It-Up (Passport-cracked)
+         beq   setup_preload
+         cmp   #$02                  ; 02 = DOS, Diversi-DOS, Pronto-DOS
+         bne   done_patches
+         lda   $B71A
+         ora   #$04                  ; 00 (Pronto-DOS) or 04 (DOS, Diversi-DOS)
+maybe_preload2
+         cmp   #$04
+         bne   done_patches
+
+setup_preload
+         jsr   preload_dos
+
+done_patches
+         jsr   PRODOS_MLI
+         !byte CMD_CLOSE
+         !word rwts_close_parms
+         jsr   ROM_TEXT
+         jsr   ROM_HOME
+         ldx   #$60
+         stx   $2B
+         jmp   $B700
+
+preload_dos
+         ; set up for preloading DOS
+         jsr   PRODOS_MLI
+         !byte CMD_SEEK
+         !word parm_boot_seek
+
+         ; preload for Pronto-DOS
+         ; 9C00..B3FF from T00,S09..T02,S00
+         ldx   #$9C
+         ldy   #$18
+         lda   $B71A
+         beq   +
+         ; preload for DOS 3.3, Diversi-DOS
+         ; 9A00..B4FF from T00,S09..T02,S04
+         ldx   #$9A
+         ldy   #$1C
++        stx   bf_src
+         stx   parm_boot_read_addr_hi
+         sty   parm_boot_read_len_hi
+         jsr   PRODOS_MLI
+         !byte CMD_READ
+         !word parm_boot_read
+
+         ; Copy BF00..BFFF to BE00, then adjust callers.
+         ; Most DOS disks only have entry points in BFC8..BFFF, but
+         ; the BF00=CLD variant has them starting at BF3D,
+         ; so we just copy the entire page. If the program has
+         ; custom code at BEAF, this will clobber it, and you will
+         ; probably crash around BEBA or so.
+         ldx   #$00
+bf_src=*+2
+-        lda   $FD00, x              ; SMC high byte
+         sta   $BE00, x
+         inx
+         bne   -
+
+         ; adjust callers that call entry points in BFxx to
+         ; call the newly copied code at BExx instead
+         ldx   #(end_possible_patches_lo - possible_patches_lo - 1)
+-        lda   possible_patches_lo, x
+         sta   @load + 1
+         sta   @decr + 1
+         lda   possible_patches_hi, x
+         sta   @load + 2
+         sta   @decr + 2
+@load    lda   SELF_MODIFIED_WORD
+         cmp   #$BF
+         bne   @next
+@decr    dec   SELF_MODIFIED_WORD
+@next    dex
+         bpl   -
+
+         ; put RTS at entry point of multi-sector read routine
+         ; because we just did that.
+         ; (Programs that manually call B793 later will fail,
+         ; but that is quite rare)
+         lda   #$60
+         sta   $B793
+
+         ; patch out JMP BA69 in Diversi-DOS
+         ; (these values are already there in Pronto-DOS and
+         ; all other DOS variants, so do this unconditionally)
+         lda   #$A8
+         sta   $A314
+         lda   #$A6
+         sta   $A315
+
+         ; swallow all text output until after the ']' prompt
+         ; (this is purely cosmetic and slightly evil)
+         lda   #<swallow
+         sta   $9D04
+         lda   #>swallow
+         sta   $9D05
+         ; /!\ execution falls through here to save 1 byte
+swallow
+         cmp   #$DD                  ; ']' character
+         bne   +
+         lda   #$BD                  ; restore real output vector
+         sta   $9D04
+         sta   $36
+         lda   #$9E
+         sta   $9D05
+         sta   $37
++        rts
+
+possible_patches_lo
+         !byte $79        ; DOS 3.3 variant with CLD at $BF00
+         !byte $E4        ; DOS 3.3
+         !byte $B6        ; Pronto-DOS
+         !byte $D7        ; DOS 3.3
+         !byte $98        ; DOS 3.3 variant with CLD at $BF00
+         !byte $10        ; Sunburst
+         !byte $2C        ; Sunburst
+         !byte $79        ; DOS 3.3
+         !byte $43        ; DOS 3.3
+         !byte $79        ; DOS 3.3 variant with CLD at $BF00
+end_possible_patches_lo
+
+possible_patches_hi
+         !byte $9A
+         !byte $A0
+         !byte $A6
+         !byte $A6
+         !byte $AC
+         !byte $AE
+         !byte $AE
+         !byte $B3
+         !byte $B7
+         !byte $BE
+end_possible_patches_hi
+
+parm_boot_open
+         !byte 3
+         !word dsk_filename
+         !word BOOT_PRODOS_BUFFER
+         !byte 0
+
+parm_boot_read
+         !byte 4
+         !byte 1
+         !byte 0
+parm_boot_read_addr_hi
+         !byte $B6
+         !byte 0
+parm_boot_read_len_hi
+         !byte $07
+         !word 0
+
+parm_boot_seek
+         !byte 2
+         !byte 1                     ; refnum (always 1)
+         !byte 0                     ; seek offset lo (always 0)
+parm_boot_seek_hi
+         !byte $09                   ; = logical sector on track 0
+         !byte 0
+
+;------------------------------------------------------------------------------
+; RWTS DOS shim
+; hook to redirect DOS 3.3-style disk reads & writes to 1 or more ProDOS files
+;------------------------------------------------------------------------------
+move_rwts_start
+!pseudopc RWTS {
+         sty   zp_array + RWTS_PTR - first_zp
+         sta   zp_array + RWTS_PTR+1 - first_zp
+         jsr   SwapZP                ; Y/A end up in RWTS_PTR/RWTS_PTR+1
+         ;X=FF
+         dex
+         ldy   #$08
+-        lda   (RWTS_PTR), y         ; address lo, then _hi
+         sta   rwts_read_lo-$FE, x   ; rwts_read_lo, then _hi
+         iny                         ; blame qkumba for this monstrosity
+         inx
+         bne   -
+
+         ldy   #$02
+         lda   (RWTS_PTR), y         ; drive number
+         ora   #$40                  ; -> 'A' or 'B'
+         sta   dsk_side
+
+         ldy   #$0C
+         lda   (RWTS_PTR), y         ; A=01(read) or A=02(write)
+         lsr                         ; A=00(read) or A=01(write)
+         lsr                         ; A=00, C=0(read) or C=1(write)
+         sta   rwts_seek_very_hi
+         adc   #CMD_READ             ; A=CMD_READ or A=CMD_WRITE
+         tax                         ; X=CMD_READ or X=CMD_WRITE
+
+         ldy   #$04
+         lda   (RWTS_PTR), y         ; track
+         asl
+         asl
+         asl
+         rol   rwts_seek_very_hi
+         asl
+         rol   rwts_seek_very_hi
+         iny
+         ora   (RWTS_PTR), y         ; sector
+         sta   rwts_seek_hi
+
+         jsr   PRODOS_MLI            ; open dsk file
+         !byte CMD_OPEN
+         !word rwts_open
+
+         jsr   PRODOS_MLI            ; seek to track/sector
+         !byte CMD_SEEK
+         !word rwts_seek
+
+         !byte $2C
+QuitToProDOS
+         ldx   #CMD_QUIT
+         stx   op_rwts
+         jsr   PRODOS_MLI
+op_rwts  !byte SELF_MODIFIED_BYTE
+         !word rwts_read
+
+         ; if we just read into $200, save the new value at $200 (only)
+         lda   rwts_read_hi
+         cmp   #$02
+         bne   +
+         ldx   $200
+         stx   save_200
++
+         ; if we just read into $300, self-modify so we never preserve
+         ; our reset vector
+         cmp   #$03
+page_3_protect=*+1
+         bne   preserve_our_reset    ; SMC branch target
+         lda   #$00
+         sta   page_3_protect
+         beq   skip_our_reset        ; always branches
+
+preserve_our_reset
+         ; otherwise set reset vector to quit ProDOS gracefully
+         ; (not 100% foolproof, but surprisingly effective!)
+         lda   #<QuitToProDOS
+         sta   $03F2
+         lda   #>QuitToProDOS
+         sta   $03F3
+         jsr   ROM_FINALIZE_RESET
+skip_our_reset
+
+         ; close disk image file (may clobber $200 if clock driver is
+         ; installed, while trying to update file metadata)
+         ; (also frees up B800-BBFF which was the ProDOS file buffer)
+         jsr   PRODOS_MLI
+         !byte CMD_CLOSE
+         !word rwts_close_parms
+
+         ; mass-patch BA69-BA95 with RTS opcodes (for Lock-It-Up
+         ; disks that manually call RWTS swapper entry points)
+         ldx   #$2C
+         lda   #$60
+-        sta   $BA69, x
+         dex
+         bpl   -
+         ; /!\ execution falls through to SwapZP to restore zero page
+SwapZP
+         ; save/restore chunk of zero page
+         ldx   #(last_zp - first_zp)
+-        lda   first_zp, x
+         ldy   zp_array, x
+         sta   zp_array, x
+         sty   first_zp, x
+         dex
+         bpl   -
+         ;X=FF
+
+         ; save/restore $200 (only) which is clobbered by ProDOS
+         ; on MLI close if a clock driver is installed,
+         ; but some programs expect buffer at $200 to persist
+         lda   $200
+save_200=*+1
+         ldy   #SELF_MODIFIED_BYTE
+         sty   $200
+         sta   save_200
+         clc                         ; tell RWTS caller everything is fine,
+         rts                         ; everything is always fine
+
+rwts_open
+         !byte 3
+rwts_open_filename
+         !word dsk_filename
+         !word PRODOS_BUFFER
+         !byte 0
+rwts_seek
+         !byte 2
+rwts_close_parms
+         !byte 1                     ; refnum (always 1)
+         !byte 0                     ; seek offset lo (always 0)
+rwts_seek_hi
+         !byte 0
+rwts_seek_very_hi
+         !byte 0
+rwts_read
+parm_quit
+         !byte 4
+         !byte 1                     ; refnum (always 1)
+rwts_read_lo
+         !byte 0
+rwts_read_hi
+         !byte 0
+rwts_read_len_lo
+         !byte 0
+rwts_read_len_hi
+         !byte 1                     ; read length (always $100)
+         !word 0                     ; actual length (ignored)
+
+dsk_filename
+         !byte 6
+         !raw  "SIDE."
+dsk_side
+         !raw  "A"
+
+zp_array
+;         !fill (last_zp - first_zp + 1)
+}
