@@ -1,5 +1,5 @@
 ;license:MIT
-;(c) 2024 by 4am
+;(c) 2024-5 by 4am
 ;
 
 !ifndef _CONSTANTS_ {
@@ -15,8 +15,6 @@ PRODOS_MEMORY_MAP         = $BF58
 ROM_TEXT                  = $FB2F
 ROM_FINALIZE_RESET        = $FB6F
 ROM_HOME                  = $FC58
-ROM_IN0                   = $FE89
-ROM_PR0                   = $FE93
 
 ; ProDOS constants
 CMD_QUIT                  = $65
